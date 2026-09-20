@@ -67,16 +67,37 @@ export interface FinancialTableOptions {
   groupByFsDiv?: boolean;
 }
 
+function hasAmount(val: unknown): boolean {
+  if (typeof val !== "string") return false;
+  const v = val.trim();
+  return v !== "" && v !== "-";
+}
+
 function renderFinancialRows(
   items: Array<Record<string, unknown>>,
   title: string
 ): string {
   const first = items[0];
   const hasThreeTerms = first.bfefrmtrm_amount !== undefined;
+  // 분·반기 보고서의 손익 항목은 당기(해당 분기 3개월)와 누적 금액을 따로 준다.
+  // 누적 칸을 빼면 3개월치가 반기·분기 누적 실적처럼 읽히므로 함께 싣는다.
+  const hasCumulative = items.some((i) => hasAmount(i.thstrm_add_amount));
 
   const lines = [`### ${title}`, ""];
 
-  if (hasThreeTerms) {
+  if (hasCumulative) {
+    lines.push(
+      `> 분·반기 손익: '당기'는 해당 분기 3개월, '당기 누적'은 사업연도 개시일부터의 누적. 재무상태표의 '전기'는 전기말 기준.`,
+      "",
+      `| 재무제표 | 계정명 | 당기 | 당기 누적 | 전기 | 전기 누적 |`,
+      `|----------|--------|------|-----------|------|-----------|`
+    );
+    for (const item of items) {
+      lines.push(
+        `| ${item.sj_nm} | ${item.account_nm} | ${formatNumber(item.thstrm_amount as string)} | ${formatNumber(item.thstrm_add_amount as string)} | ${formatNumber(item.frmtrm_amount as string)} | ${formatNumber(item.frmtrm_add_amount as string)} |`
+      );
+    }
+  } else if (hasThreeTerms) {
     lines.push(
       `| 재무제표 | 계정명 | 당기 (${first.thstrm_nm || "Current"}) | 전기 (${first.frmtrm_nm || "Prior"}) | 전전기 (${first.bfefrmtrm_nm || "Pre-Prior"}) |`,
       `|----------|--------|------|------|--------|`
