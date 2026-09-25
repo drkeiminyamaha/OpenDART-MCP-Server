@@ -60,7 +60,7 @@ function markBoldSpans(s: string): string {
 // 셀 안의 문단·줄바꿈은 공백으로 이어 붙인다(한 행이 한 줄에 오도록). keepBreaks면 줄바꿈을 살린다(1열 설명 표용).
 function cellText(inner: string, keepBreaks = false): string {
   const br = keepBreaks ? "\n" : " ";
-  let s = inner.replace(/<(BR|PGBRK)\b[^>]*\/?>/gi, br).replace(/<\/?P\b[^>]*>/gi, br);
+  let s = inner.replace(/\n/g, br).replace(/<(BR|PGBRK)\b[^>]*\/?>/gi, br).replace(/<\/?P\b[^>]*>/gi, br);
   s = crEntities(s, br);
   s = s.replace(/\u0001/g, br);
   s = s.replace(/<[^>]+>/g, "");
@@ -143,8 +143,10 @@ function xmlToText(xml: string): string {
   }
   s = s.replace(/<SUMMARY\b[\s\S]*?<\/SUMMARY>/gi, "");
   s = s.replace(/<(FORMULA-VERSION|EXTRACTION)\b[^>]*?(?:\/>|>[\s\S]*?<\/\1>)/gi, "");
-  // 원문 XML의 줄바꿈·들여쓰기는 의미가 없다(뷰어도 무시). 구조는 태그로만 만든다.
-  s = s.replace(/[\r\n\t]+/g, " ");
+  // 태그 사이의 줄바꿈·들여쓰기(서식용)는 지운다. 글자 사이의 줄바꿈은 DART 뷰어가 <BR>로 보여주므로 줄바꿈으로 살린다.
+  s = s.replace(/\r\n?/g, "\n");
+  s = s.replace(/>[ \t]*\n\s*</g, "><");
+  s = s.replace(/\t/g, " ");
   s = markBoldSpans(s);
   // 표는 따로 풀어 두었다가 마지막에 되돌린다.
   const tables: string[] = [];
