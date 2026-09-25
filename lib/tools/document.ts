@@ -45,11 +45,24 @@ function crEntities(s: string, repl: string): string {
   return s.replace(/&(cr|crlf|lf);/gi, repl);
 }
 
+// 굵은 글씨 SPAN(USERMARK="B")은 주석 제목이다. 문단 안에 본문과 이어 붙어 있어도 제목 앞뒤로 줄을 나눈다.
+// USERMARK="!B"(굵게 해제)로 시작하는 SPAN은 제목 뒤 본문의 시작이다. 줄 나눔 자리는 \u0001로 표시해 두고 나중에 바꾼다.
+function markBoldSpans(s: string): string {
+  return s.replace(/<SPAN\b([^>]*)>([\s\S]*?)<\/SPAN>/gi, (_m, attrs: string, inner: string) => {
+    const um = /USERMARK\s*=\s*["']([^"']*)["']/i.exec(attrs)?.[1] ?? "";
+    const tokens = um.split(/\s+/);
+    if (tokens.includes("B")) return `\u0001${inner}\u0001`;
+    if (tokens.includes("!B")) return `\u0001${inner}`;
+    return inner;
+  });
+}
+
 // 셀 안의 문단·줄바꿈은 공백으로 이어 붙인다(한 행이 한 줄에 오도록). keepBreaks면 줄바꿈을 살린다(1열 설명 표용).
 function cellText(inner: string, keepBreaks = false): string {
   const br = keepBreaks ? "\n" : " ";
   let s = inner.replace(/<(BR|PGBRK)\b[^>]*\/?>/gi, br).replace(/<\/?P\b[^>]*>/gi, br);
   s = crEntities(s, br);
+  s = s.replace(/\u0001/g, br);
   s = s.replace(/<[^>]+>/g, "");
   s = decodeEntities(s);
   if (keepBreaks) {
@@ -132,6 +145,7 @@ function xmlToText(xml: string): string {
   s = s.replace(/<(FORMULA-VERSION|EXTRACTION)\b[^>]*?(?:\/>|>[\s\S]*?<\/\1>)/gi, "");
   // 원문 XML의 줄바꿈·들여쓰기는 의미가 없다(뷰어도 무시). 구조는 태그로만 만든다.
   s = s.replace(/[\r\n\t]+/g, " ");
+  s = markBoldSpans(s);
   // 표는 따로 풀어 두었다가 마지막에 되돌린다.
   const tables: string[] = [];
   s = s.replace(/<TABLE\b[^>]*>([\s\S]*?)<\/TABLE>/gi, (_m, inner: string) => {
@@ -149,6 +163,7 @@ function xmlToText(xml: string): string {
   s = s.replace(/<P\b[^>]*>/gi, "\n");
   s = s.replace(/<\/(P|TR|SECTION-\d|LIBRARY|COVER-TITLE|DOCUMENT-NAME|COMPANY-NAME)>/gi, "\n");
   s = crEntities(s, "\n");
+  s = s.replace(/\u0001/g, "\n");
   s = s.replace(/<[^>]+>/g, "");
   s = decodeEntities(s);
   s = s.replace(/\u0000T(\d+)\u0000/g, (_m, i: string) => tables[Number(i)] ?? "");
@@ -257,21 +272,36 @@ export function registerDocumentTools(server: McpServer) {
           };
 
           if (params.raw) {
-            // 원문 XML에서는 태그가 글자 사이에 끼므로 단어 단위로 찾는다.
-            const pats = words.map((w) => w.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+            // 원문 XML에서는 태그·공백이 글자 사이에 낄 수 있으므로 그것을 건너뛰며 구절 전체로 찾는다. BODY 앞(머리말)은 제외.
+            const gap = "(?:\\s|<[^>]*>)*";
+            const rawPhrase = Array.from(words.join("").toLowerCase())
+              .map((ch) => ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+              .join(gap);
             const raws: string[] = [];
-            for (const { i, f } of selected) {
-              let lastEnd = -1;
-              for (const p of collect(f.xml.toLowerCase(), pats, 200)) {
-                if (raws.length >= 5) break;
-                const start = Math.max(0, p - 300);
-                if (start < lastEnd) continue;
-                const end = Math.min(f.xml.length, p + 1200);
-                raws.push(`### [${i}] ${f.title} · 원문 XML offset ${start}\n${f.xml.slice(start, end)}`);
-                lastEnd = end;
+            let rawMode = "구절 일치";
+            const scan = (pats: string[]) => {
+              raws.length = 0;
+              for (const { i, f } of selected) {
+                const lowerXml = f.xml.toLowerCase();
+                const bodyAt = Math.max(0, lowerXml.search(/<body\b/));
+                let lastEnd = -1;
+                for (const p of collect(lowerXml, pats, 400)) {
+                  if (raws.length >= 5) break;
+                  if (p < bodyAt) continue;
+                  const start = Math.max(0, p - 300);
+                  if (start < lastEnd) continue;
+                  const end = Math.min(f.xml.length, p + 1200);
+                  raws.push(`### [${i}] ${f.title} · 원문 XML offset ${start}\n${f.xml.slice(start, end)}`);
+                  lastEnd = end;
+                }
               }
+            };
+            scan([rawPhrase]);
+            if (!raws.length && words.length > 1) {
+              rawMode = "구절 없음 → 단어 중 하나라도 일치";
+              scan(words.map((w) => w.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
             }
-            L.push(`## 원문 XML "${params.find}" — ${raws.length}곳(최대 5곳)`);
+            L.push(`## 원문 XML "${params.find}" (${rawMode}) — ${raws.length}곳(최대 5곳, 본문만)`);
             L.push(raws.length ? raws.join("\n\n---\n\n") : "일치하는 부분이 없습니다.");
             return { content: [{ type: "text" as const, text: L.join("\n") }] };
           }
