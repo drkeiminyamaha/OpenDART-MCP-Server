@@ -64,7 +64,7 @@ function cellText(inner: string, keepBreaks = false): string {
   s = crEntities(s, br);
   s = s.replace(/\u0001/g, br);
   s = s.replace(/<[^>]+>/g, "");
-  s = decodeEntities(s);
+  s = decodeEntities(s).replace(/\r\n?|[\u2028\u2029\u0085\u000b\u000c]/g, br);
   if (keepBreaks) {
     return s
       .split("\n")
@@ -168,6 +168,8 @@ function xmlToText(xml: string): string {
   s = s.replace(/\u0001/g, "\n");
   s = s.replace(/<[^>]+>/g, "");
   s = decodeEntities(s);
+  // 숫자 엔티티(&#13; 등)로 들어온 줄바꿈 문자도 줄바꿈으로 통일한다.
+  s = s.replace(/\r\n?|[\u2028\u2029\u0085\u000b\u000c]/g, "\n");
   s = s.replace(/\u0000T(\d+)\u0000/g, (_m, i: string) => tables[Number(i)] ?? "");
   return s
     .split("\n")
