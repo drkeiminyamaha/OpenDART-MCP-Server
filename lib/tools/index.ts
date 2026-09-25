@@ -8,6 +8,7 @@ import { registerShareholdingTools } from "./shareholding";
 import { registerMajorEventTools } from "./major-events";
 import { registerSecuritiesRegTools } from "./securities-reg";
 import { registerWorkflowTools } from "./workflows";
+import { registerDocumentTools } from "./document";
 
 function registerConfigTools(server: McpServer) {
   server.tool(
@@ -62,4 +63,5 @@ export function registerAllTools(server: McpServer) {
   registerShareholdingTools(server);   // Shareholding disclosures
   registerMajorEventTools(server);     // Major corporate events
   registerSecuritiesRegTools(server);  // Securities registration statements
+  registerDocumentTools(server);       // Disclosure original text (document.xml)
 }
