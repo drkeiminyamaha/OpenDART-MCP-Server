@@ -44,32 +44,72 @@ function crEntities(s: string, repl: string): string {
   return s.replace(/&(cr|crlf|lf);/gi, repl);
 }
 
-// 셀 안의 문단·줄바꿈은 공백으로 이어 붙인다(한 행이 한 줄에 오도록).
-function cellText(inner: string): string {
-  let s = inner.replace(/<(BR|PGBRK)\b[^>]*\/?>/gi, " ").replace(/<\/P>/gi, " ");
-  s = crEntities(s, " ");
+// 셀 안의 문단·줄바꿈은 공백으로 이어 붙인다(한 행이 한 줄에 오도록). keepBreaks면 줄바꿈을 살린다(1열 설명 표용).
+function cellText(inner: string, keepBreaks = false): string {
+  const br = keepBreaks ? "\n" : " ";
+  let s = inner.replace(/<(BR|PGBRK)\b[^>]*\/?>/gi, br).replace(/<\/P>/gi, br);
+  s = crEntities(s, br);
   s = s.replace(/<[^>]+>/g, "");
   s = decodeEntities(s);
+  if (keepBreaks) {
+    return s
+      .split("\n")
+      .map((l) => l.replace(/[ \t\u00a0]+/g, " ").trim())
+      .filter(Boolean)
+      .join("\n");
+  }
   return s.replace(/\s+/g, " ").trim().replace(/\|/g, "/");
 }
 
 // 표 하나를 "| 셀 | 셀 |" 한 행 한 줄로 만든다. 셀 태그는 TD·TH(일반 표)와 TE·TU(재무제표 표) 넷이다.
+// COLSPAN은 빈칸으로 자리를 채우고, ROWSPAN은 아래 행에 같은 값을 채워 열이 밀리지 않게 한다.
+// 모든 행에 값이 한 칸뿐인 표(주석 설명을 1열 표로 감싼 경우)는 표가 아니라 문단으로 푼다.
 function renderTable(inner: string): string {
-  const rows: string[] = [];
+  const grid: string[][] = [];
+  const textual: string[] = [];
+  let maxFilled = 0;
+  const pending = new Map<number, { v: string; left: number }>();
   const trRe = /<TR\b[^>]*>([\s\S]*?)<\/TR>/gi;
   let tr: RegExpExecArray | null;
   while ((tr = trRe.exec(inner))) {
-    const cells: string[] = [];
+    const row: string[] = [];
+    let col = 0;
+    const fillPending = () => {
+      let p = pending.get(col);
+      while (p && p.left > 0) {
+        row.push(p.v);
+        p.left -= 1;
+        if (p.left <= 0) pending.delete(col);
+        col += 1;
+        p = pending.get(col);
+      }
+    };
     const cellRe = /<(TD|TH|TE|TU)\b([^>]*?)(?:\/>|>([\s\S]*?)<\/\1\s*>)/gi;
     let c: RegExpExecArray | null;
+    const rowTexts: string[] = [];
     while ((c = cellRe.exec(tr[1]))) {
-      cells.push(c[3] !== undefined ? cellText(c[3]) : "");
-      const span = parseInt(/COLSPAN\s*=\s*["']?(\d+)/i.exec(c[2])?.[1] ?? "1", 10);
-      for (let k = 1; k < Math.min(span, 30); k++) cells.push("");
+      fillPending();
+      const body = c[3] ?? "";
+      const txt = body ? cellText(body) : "";
+      if (txt) rowTexts.push(cellText(body, true));
+      const cs = Math.min(parseInt(/COLSPAN\s*=\s*["']?(\d+)/i.exec(c[2])?.[1] ?? "1", 10) || 1, 30);
+      const rs = Math.min(parseInt(/ROWSPAN\s*=\s*["']?(\d+)/i.exec(c[2])?.[1] ?? "1", 10) || 1, 200);
+      for (let k = 0; k < cs; k++) {
+        const v = k === 0 ? txt : "";
+        row.push(v);
+        if (rs > 1) pending.set(col, { v, left: rs - 1 });
+        col += 1;
+      }
     }
-    if (cells.some((x) => x !== "")) rows.push(`| ${cells.join(" | ")} |`);
+    fillPending();
+    const filled = new Set(row.filter((x) => x !== "")).size;
+    if (!filled) continue;
+    maxFilled = Math.max(maxFilled, filled);
+    grid.push(row);
+    textual.push(rowTexts.join("\n"));
   }
-  return rows.join("\n");
+  if (maxFilled <= 1) return textual.filter(Boolean).join("\n");
+  return grid.map((r) => `| ${r.join(" | ")} |`).join("\n");
 }
 
 function xmlToText(xml: string): string {
@@ -154,11 +194,11 @@ export function registerDocumentTools(server: McpServer) {
 - 비상장 외감법인의 감사보고서도 됩니다. 순서: opendart_search_company로 corp_code → opendart_search_disclosure(pblntf_ty="F" 외부감사)로 감사보고서 접수번호 → 이 도구.
 - 사업보고서처럼 첨부가 있는 공시는 ZIP 안에 파일이 여러 개입니다(본문, 감사보고서, 연결감사보고서 등). 결과 첫머리에 파일 목록이 나오고 file_index로 하나만 볼 수 있습니다.
 - 본문이 길면 offset·max_chars로 나눠 받습니다. find에 검색어를 주면 해당 부분 주변만 모아서 줍니다(예: "재무상태표", "계속기업", "특수관계자").
-- 표는 "| 셀 | 셀 |" 형태로 한 행을 한 줄에 풀어 둡니다(병합 셀은 빈칸으로 자리만 채움). 숫자 단위는 원문 표의 단위 표기를 따릅니다.`,
+- 표는 "| 셀 | 셀 |" 형태로 한 행을 한 줄에 풀어 둡니다(가로 병합 셀은 빈칸, 세로 병합 셀은 같은 값으로 채움). 값이 한 칸뿐인 설명용 표는 문단으로 풉니다. 숫자 단위는 원문 표의 단위 표기를 따릅니다.`,
       inputSchema: {
         rcept_no: z.string().regex(/^\d{14}$/).describe("14자리 접수번호 (opendart_search_disclosure 결과)"),
         file_index: z.number().int().min(0).optional().describe("ZIP 안 파일 번호(0부터). 생략하면 전체를 이어서 반환"),
-        find: z.string().optional().describe("검색어. 주면 일치 부분 주변만 반환(공백으로 나눈 단어 중 하나라도 일치)"),
+        find: z.string().optional().describe("검색어. 주면 일치 부분 주변만 반환(공백으로 나눈 단어 중 하나라도 일치, 원문의 글자 사이 띄어쓰기는 무시)"),
         offset: z.number().int().min(0).optional().describe("본문 시작 위치(문자 수, 기본 0)"),
         max_chars: z.number().int().min(1000).max(60000).optional().describe("반환 최대 문자 수(기본 15000, 최대 60000)"),
         api_key: z.string().optional().describe("Optional: your own OpenDART API key"),
@@ -200,10 +240,15 @@ export function registerDocumentTools(server: McpServer) {
             const lower = f.text.toLowerCase();
             const positions: number[] = [];
             for (const w of words) {
-              let p = lower.indexOf(w.toLowerCase());
-              while (p >= 0 && positions.length < 200) {
-                positions.push(p);
-                p = lower.indexOf(w.toLowerCase(), p + w.length);
+              // 원문 제목이 "재 무 상 태 표"처럼 띄어 쓰인 경우도 잡도록 글자 사이 공백을 허용한다.
+              const pattern = Array.from(w.toLowerCase())
+                .map((ch) => ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+                .join("\\s*");
+              const re = new RegExp(pattern, "g");
+              let m: RegExpExecArray | null;
+              while ((m = re.exec(lower)) && positions.length < 200) {
+                positions.push(m.index);
+                if (m[0].length === 0) re.lastIndex += 1;
               }
             }
             positions.sort((a, b) => a - b);
