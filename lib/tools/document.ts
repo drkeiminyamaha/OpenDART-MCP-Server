@@ -13,6 +13,7 @@ interface DocFile {
   name: string;
   title: string;
   text: string;
+  xml: string;
 }
 
 function decodeBytes(bytes: Uint8Array): string {
@@ -47,7 +48,7 @@ function crEntities(s: string, repl: string): string {
 // 셀 안의 문단·줄바꿈은 공백으로 이어 붙인다(한 행이 한 줄에 오도록). keepBreaks면 줄바꿈을 살린다(1열 설명 표용).
 function cellText(inner: string, keepBreaks = false): string {
   const br = keepBreaks ? "\n" : " ";
-  let s = inner.replace(/<(BR|PGBRK)\b[^>]*\/?>/gi, br).replace(/<\/P>/gi, br);
+  let s = inner.replace(/<(BR|PGBRK)\b[^>]*\/?>/gi, br).replace(/<\/?P\b[^>]*>/gi, br);
   s = crEntities(s, br);
   s = s.replace(/<[^>]+>/g, "");
   s = decodeEntities(s);
@@ -144,6 +145,8 @@ function xmlToText(xml: string): string {
   s = s.replace(/<TITLE\b[^>]*>/gi, "\n\n## ");
   s = s.replace(/<\/TITLE>/gi, "\n");
   s = s.replace(/<(BR|PGBRK)\b[^>]*\/?>/gi, "\n");
+  // 문단은 여는 태그에서도 줄을 바꾼다(닫는 태그 없이 이어지는 문단 대비).
+  s = s.replace(/<P\b[^>]*>/gi, "\n");
   s = s.replace(/<\/(P|TR|SECTION-\d|LIBRARY|COVER-TITLE|DOCUMENT-NAME|COMPANY-NAME)>/gi, "\n");
   s = crEntities(s, "\n");
   s = s.replace(/<[^>]+>/g, "");
@@ -178,7 +181,7 @@ async function fetchDocument(rceptNo: string, apiKey: string): Promise<DocFile[]
   for (const [name, bytes] of Object.entries(files)) {
     if (!/\.xml$/i.test(name)) continue;
     const xml = decodeBytes(bytes);
-    out.push({ name, title: docTitle(xml, name), text: xmlToText(xml) });
+    out.push({ name, title: docTitle(xml, name), text: xmlToText(xml), xml });
   }
   // 본문(접수번호.xml)이 먼저, 첨부(접수번호_00760.xml 등)는 뒤로
   out.sort((a, b) => a.name.length - b.name.length || a.name.localeCompare(b.name));
@@ -198,7 +201,8 @@ export function registerDocumentTools(server: McpServer) {
       inputSchema: {
         rcept_no: z.string().regex(/^\d{14}$/).describe("14자리 접수번호 (opendart_search_disclosure 결과)"),
         file_index: z.number().int().min(0).optional().describe("ZIP 안 파일 번호(0부터). 생략하면 전체를 이어서 반환"),
-        find: z.string().optional().describe("검색어. 주면 일치 부분 주변만 반환(공백으로 나눈 단어 중 하나라도 일치, 원문의 글자 사이 띄어쓰기는 무시)"),
+        find: z.string().optional().describe("검색어. 주면 일치 부분 주변만 반환. 여러 단어면 먼저 구절 전체로 찾고, 없을 때만 단어 중 하나라도 일치로 넓힘. 원문의 글자 사이 띄어쓰기는 무시"),
+        raw: z.boolean().optional().describe("true면 find 주변의 원문 XML을 가공 없이 반환(파서 점검용, 최대 5곳)"),
         offset: z.number().int().min(0).optional().describe("본문 시작 위치(문자 수, 기본 0)"),
         max_chars: z.number().int().min(1000).max(60000).optional().describe("반환 최대 문자 수(기본 15000, 최대 60000)"),
         api_key: z.string().optional().describe("Optional: your own OpenDART API key"),
@@ -233,37 +237,72 @@ export function registerDocumentTools(server: McpServer) {
 
         if (params.find && params.find.trim()) {
           const words = params.find.trim().split(/\s+/).filter(Boolean);
-          const ctx = 600;
-          const hits: string[] = [];
-          let total = 0;
-          for (const { i, f } of selected) {
-            const lower = f.text.toLowerCase();
+          // 원문 제목이 "재 무 상 태 표"처럼 띄어 쓰인 경우도 잡도록 글자 사이 공백을 허용한다.
+          const charPattern = (w: string) =>
+            Array.from(w.toLowerCase())
+              .map((ch) => ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+              .join("\\s*");
+          const phrase = words.map(charPattern).join("\\s*");
+          const collect = (hay: string, patterns: string[], limit: number) => {
             const positions: number[] = [];
-            for (const w of words) {
-              // 원문 제목이 "재 무 상 태 표"처럼 띄어 쓰인 경우도 잡도록 글자 사이 공백을 허용한다.
-              const pattern = Array.from(w.toLowerCase())
-                .map((ch) => ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-                .join("\\s*");
-              const re = new RegExp(pattern, "g");
+            for (const pat of patterns) {
+              const re = new RegExp(pat, "g");
               let m: RegExpExecArray | null;
-              while ((m = re.exec(lower)) && positions.length < 200) {
+              while ((m = re.exec(hay)) && positions.length < limit) {
                 positions.push(m.index);
                 if (m[0].length === 0) re.lastIndex += 1;
               }
             }
-            positions.sort((a, b) => a - b);
-            total += positions.length;
-            let lastEnd = -1;
-            for (const p of positions) {
-              if (hits.length >= 20) break;
-              const start = Math.max(0, p - 200);
-              if (start < lastEnd) continue;
-              const end = Math.min(f.text.length, p + ctx);
-              hits.push(`### [${i}] ${f.title} · offset ${start}\n${f.text.slice(start, end)}`);
-              lastEnd = end;
+            return positions.sort((x, y) => x - y);
+          };
+
+          if (params.raw) {
+            // 원문 XML에서는 태그가 글자 사이에 끼므로 단어 단위로 찾는다.
+            const pats = words.map((w) => w.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+            const raws: string[] = [];
+            for (const { i, f } of selected) {
+              let lastEnd = -1;
+              for (const p of collect(f.xml.toLowerCase(), pats, 200)) {
+                if (raws.length >= 5) break;
+                const start = Math.max(0, p - 300);
+                if (start < lastEnd) continue;
+                const end = Math.min(f.xml.length, p + 1200);
+                raws.push(`### [${i}] ${f.title} · 원문 XML offset ${start}\n${f.xml.slice(start, end)}`);
+                lastEnd = end;
+              }
             }
+            L.push(`## 원문 XML "${params.find}" — ${raws.length}곳(최대 5곳)`);
+            L.push(raws.length ? raws.join("\n\n---\n\n") : "일치하는 부분이 없습니다.");
+            return { content: [{ type: "text" as const, text: L.join("\n") }] };
           }
-          L.push(`## 검색 "${params.find}" — 출현 ${total}회${total >= 200 ? " 이상" : ""}, 구간 ${hits.length}곳${hits.length >= 20 ? "(20곳까지만 표시)" : ""} · 가까운 출현은 한 구간으로 묶음`);
+
+          const ctx = 600;
+          const hits: string[] = [];
+          let total = 0;
+          let mode = words.length > 1 ? "구절 일치" : "일치";
+          const run = (patterns: string[]) => {
+            hits.length = 0;
+            total = 0;
+            for (const { i, f } of selected) {
+              const positions = collect(f.text.toLowerCase(), patterns, 200);
+              total += positions.length;
+              let lastEnd = -1;
+              for (const p of positions) {
+                if (hits.length >= 20) break;
+                const start = Math.max(0, p - 200);
+                if (start < lastEnd) continue;
+                const end = Math.min(f.text.length, p + ctx);
+                hits.push(`### [${i}] ${f.title} · offset ${start}\n${f.text.slice(start, end)}`);
+                lastEnd = end;
+              }
+            }
+          };
+          run([phrase]);
+          if (total === 0 && words.length > 1) {
+            mode = "구절 없음 → 단어 중 하나라도 일치";
+            run(words.map(charPattern));
+          }
+          L.push(`## 검색 "${params.find}" (${mode}) — 출현 ${total}회${total >= 200 ? " 이상" : ""}, 구간 ${hits.length}곳${hits.length >= 20 ? "(20곳까지만 표시)" : ""} · 가까운 출현은 한 구간으로 묶음`);
           L.push(hits.length ? hits.join("\n\n---\n\n") : "일치하는 부분이 없습니다.");
           return { content: [{ type: "text" as const, text: L.join("\n") }] };
         }
